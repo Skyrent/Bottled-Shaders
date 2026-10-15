@@ -31,6 +31,10 @@ on:
                 description: "CMake configure/build preset for the C++ build (ALL = full LTCG shipping flags; PR = mild optimization without LTCG or full debug info)"
                 type: string
                 default: "ALL"
+            steam-deck-optimizations:
+                description: "Build tuned for Steam Deck (Zen 2): AVX2 codegen + LTCG. Result needs a CPU with AVX2 and is uploaded as a separate artifact (dist-artifacts-steamdeck)"
+                type: boolean
+                default: false
         outputs:
             version:
                 description: "CMake project version extracted from the build"
@@ -69,14 +73,23 @@ jobs:
               id: setup
               uses: ./.github/actions/setup-build-environment
               with:
-                  cache-key-suffix: "cpp-${{ matrix.compiler.name }}${{ inputs.cache-key-suffix }}"
+                  cache-key-suffix: "cpp-${{ matrix.compiler.name }}${{ inputs.steam-deck-optimizations && '-steamdeck' || '' }}${{ inputs.cache-key-suffix }}"
                   cmake-preset: ${{ matrix.compiler.cmake-preset }}
                   build-dir: ${{ matrix.compiler.build-dir }}
 
+            # Steam Deck (Zen 2) tuning. The compiler is MSVC (cl.exe), which does not understand
+            # the GCC/Clang flags (-march=znver2, -mtune, -O3, -pipe, -fomit-frame-pointer):
+            #   -march=znver2         -> /arch:AVX2  (Zen 2 has AVX2/FMA/BMI2)
+            #   -O3                   -> already covered by the preset's /O2
+            #   -fomit-frame-pointer  -> already the default on x64
+            # _CL_ is appended to every cl.exe call, so the preset's own CMAKE_CXX_FLAGS stay untouched.
             - name: Build using run-cmake
               uses: lukka/run-cmake@v10
+              env:
+                  _CL_: ${{ inputs.steam-deck-optimizations && '/arch:AVX2' || '' }}
               with:
                   configurePreset: ${{ matrix.compiler.cmake-preset }}
+                  configurePresetAdditionalArgs: ${{ inputs.steam-deck-optimizations && '["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=TRUE"]' || '[]' }}
                   buildPreset: ${{ matrix.compiler.cmake-preset }}
 
             - name: Extract version from CMake
@@ -115,7 +128,7 @@ jobs:
               if: success() && matrix.compiler.name == 'vs2026'
               uses: actions/upload-artifact@v7
               with:
-                  name: dist-artifacts
+                  name: ${{ inputs.steam-deck-optimizations && 'dist-artifacts-steamdeck' || 'dist-artifacts' }}
                   path: dist/
                   retention-days: 30
 
