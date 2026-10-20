@@ -4,6 +4,7 @@
 #include "Editor/Effects11Editor.h"
 #include "Features/Effects11.h"
 #include "Features/ProceduralSun.h"
+#include "Features/RainRefraction.h"
 #include "Features/ReverseZ.h"
 #include "Features/SkySync.h"
 #include "Globals.h"
@@ -118,7 +119,8 @@ void EffectManager::LogPresetStatus() const
 
 void EffectManager::Apply()
 {
-	globals::features::effects11.LoadRaindropTexture();
+	if (auto& rainRefraction = globals::features::rainRefraction; rainRefraction.loaded)
+		rainRefraction.LoadPresetRaindrops(PresetManager::GetSingleton().GetENBSeriesPath());
 
 	enbDepthOfField.Apply();
 	enbBloom.Apply();
@@ -283,6 +285,7 @@ void EffectManager::RegisterSettings()
 
 	settingManager.RegisterBoolSetting("EnableCloudsLightingFromMoon", "SKYSCATTERING", true, false);
 	settingManager.RegisterBoolSetting("CalculateCloudsEdgeFromScattering", "SKYSCATTERING", false, false);
+	settingManager.RegisterBoolSetting("EnableCloudsEdge", "SKYSCATTERING", true, false);
 	settingManager.RegisterTimeOfDaySetting("AtmosphereThickness", "SKYSCATTERING", 1.0f, 0.05f, 100.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("HorizonRange", "SKYSCATTERING", 0.5f, 0.0f, 1.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("Intensity", "SKYSCATTERING", 1.0f, 0.0f, 30000.0f, 0.01f, true);
@@ -307,6 +310,7 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterTimeOfDaySetting("CloudsLightingForwardScattering", "SKYSCATTERING", 0.0f, 0.0f, 5.0f, 0.01f, true);
 
 	settingManager.RegisterBoolSetting("EnableLighting", "VOLUMETRICFOG", false, false);
+	settingManager.RegisterBoolSetting("EnableShadows", "VOLUMETRICFOG", true, false);
 	settingManager.RegisterTimeOfDaySetting("Intensity", "VOLUMETRICFOG", 1.0f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("Curve", "VOLUMETRICFOG", 1.0f, 1.0f, 2.5f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("ShadowAmount", "VOLUMETRICFOG", 0.5f, 0.0f, 0.8f, 0.01f, true);
@@ -328,6 +332,10 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterBoolSetting("Enable", "RAIN", true, false);
 	settingManager.RegisterTimeOfDaySetting("MotionStretch", "RAIN", 0.28f, 0.0f, 1.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("MotionTransparency", "RAIN", 0.1f, 0.0f, 1.0f, 0.01f, true);
+	settingManager.RegisterBoolSetting("EnableSupersampling", "RAIN", false, false);
+	settingManager.RegisterFloatSetting("RefractionFactor", "RAIN", 1.0f, 0.0f, 2.0f, 0.01f, false);
+	settingManager.RegisterTimeOfDaySetting("MotionBluriness", "RAIN", 1.0f, 0.0f, 6.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("Brightness", "RAIN", 1.0f, 0.0f, 10.0f, 0.01f, true);
 
 	settingManager.RegisterBoolSetting("Enable", "NIGHTEYE", true, false);
 	settingManager.RegisterTimeOfDaySetting("Intensity", "NIGHTEYE", 1.0f, 0.0f, 1.0f, 0.01f, true);
@@ -339,13 +347,15 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterTimeOfDaySetting("LowClip", "NIGHTEYE", 0.0f, 0.0f, 1.0f, 0.01f, true);
 	settingManager.RegisterFloatSetting("FadeTime", "NIGHTEYE", 0.5f, 0.0f, 5.0f, 0.01f, false);
 
-	settingManager.RegisterTimeOfDaySetting("Amount", "CLOUDSHADOWS", 0.8f, 0.0f, 4.0f, 0.01f, true);
+	settingManager.RegisterTimeOfDaySetting("Amount", "CLOUDSHADOWS", 0.5f, 0.0f, 4.0f, 0.01f, true);
 
 	settingManager.RegisterTimeOfDaySetting("Intensity", "GAMEVOLUMETRICRAYS", 1.0f, 0.0f, 1000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("RangeFactor", "GAMEVOLUMETRICRAYS", 1.0f, 0.0f, 100.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("Desaturation", "GAMEVOLUMETRICRAYS", 0.0f, -1.0f, 1.0f, 0.01f, true);
 	settingManager.RegisterColorTimeOfDaySetting("ColorFilter", "GAMEVOLUMETRICRAYS", { 1.0f, 1.0f, 1.0f }, true);
+	settingManager.RegisterBoolSetting("DisableGameDithering", "GAMEVOLUMETRICRAYS", false, false);
 
+	settingManager.RegisterFloatSetting("Quality", "VOLUMETRICRAYS", 0.0f, -1.0f, 2.0f, 1.0f, false);
 	settingManager.RegisterTimeOfDaySetting("Intensity", "VOLUMETRICRAYS", 0.2f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("Density", "VOLUMETRICRAYS", 1.0f, 0.1f, 10.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("SkyColorAmount", "VOLUMETRICRAYS", 0.5f, 0.0f, 100.0f, 0.01f, true);
@@ -353,6 +363,7 @@ void EffectManager::RegisterSettings()
 	settingManager.RegisterBoolSetting("UseLinearMath", "RAYS", false, false);
 	settingManager.RegisterFloatSetting("Quality", "RAYS", 2.0f, -2.0f, 2.0f, 1.0f, false);
 	settingManager.RegisterFloatSetting("Type", "RAYS", 0.0f, 0.0f, 4.0f, 1.0f, false);
+	settingManager.RegisterFloatSetting("MoonType", "RAYS", 0.0f, 0.0f, 4.0f, 1.0f, false);
 	settingManager.RegisterTimeOfDaySetting("SunRaysMultiplier", "RAYS", 1.0f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("MoonRaysMultiplier", "RAYS", 1.0f, 0.0f, 30000.0f, 0.01f, true);
 	settingManager.RegisterTimeOfDaySetting("SkyColorAmount", "RAYS", 0.0f, 0.0f, 100.0f, 0.01f, true);
@@ -403,6 +414,8 @@ void EffectManager::RegisterSettings()
 	ids.gammaCurve = settingManager.GetSettingID("GammaCurve", "COLORCORRECTION");
 
 	ids.enableRain = settingManager.GetSettingID("Enable", "RAIN");
+	ids.rainRefractionFactor = settingManager.GetSettingID("RefractionFactor", "RAIN");
+	ids.rainSupersampling = settingManager.GetSettingID("EnableSupersampling", "RAIN");
 
 	ids.nightEyeEnable = settingManager.GetSettingID("Enable", "NIGHTEYE");
 	ids.nightEyeFadeTime = settingManager.GetSettingID("FadeTime", "NIGHTEYE");

@@ -1,5 +1,6 @@
 #include "ExponentialHeightFog.h"
 
+#include "CSEditor/SceneManager/SceneWidgetInterceptor.h"
 #include "Deferred.h"
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
@@ -13,7 +14,6 @@
 #include "State.h"
 #include "Utils/D3D.h"
 #include "Utils/Game.h"
-#include "WeatherVariableRegistry.h"
 
 #include <numbers>
 
@@ -174,6 +174,11 @@ ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
 {
 	Settings data = settings;
 	ClampFollowAndHazeSettings(data);
+	auto& linearLighting = globals::features::linearLighting;
+	linearLighting.SRGBToWorking(&data.inscatteringTint.x);
+	linearLighting.SRGBToWorking(&data.fogInscatteringColor.x);
+	linearLighting.SRGBToWorking(&data.volumetricFogAlbedo.x);
+	linearLighting.SRGBToWorking(&data.volumetricFogEmissive.x);
 	data.vanillaFogDensity = 0.0f;
 
 	if (IsSuppressed()) {
@@ -214,11 +219,7 @@ ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
 	const float targetOpacity = data.vanillaFogMaxOpacity * kReferenceOpacityFraction;
 	const float normalizedReference = std::pow(targetOpacity, 1.0f / fogPower);
 	const float referenceDistance = std::max((fogFar - fogNear) * normalizedReference, kMinimumFogRange);
-	const auto linearLightingData = globals::features::linearLighting.GetCommonBufferData();
-	const float calibratedOpacity = linearLightingData.enableLinearLighting ?
-	                                    std::pow(targetOpacity, linearLightingData.fogAlphaGamma) :
-	                                    targetOpacity;
-	data.vanillaFogDensity = -std::log(std::max(1.0f - calibratedOpacity, kMinimumFogTransmittance)) / (referenceDistance * kAnalyticalExtinctionScale);
+	data.vanillaFogDensity = -std::log(std::max(1.0f - targetOpacity, kMinimumFogTransmittance)) / (referenceDistance * kAnalyticalExtinctionScale);
 	return data;
 }
 
@@ -236,7 +237,7 @@ void ExponentialHeightFog::DrawSettings()
 
 	if (ImGui::BeginTabItem(T(TKEY("tab_general"), "General"))) {
 		ImGui::BeginDisabled(settings.enabled == 0);
-		DrawGeneralSettings();
+		DrawHeightFogSettings();
 		ImGui::EndDisabled();
 		ImGui::EndTabItem();
 	}
@@ -249,28 +250,28 @@ void ExponentialHeightFog::DrawSettings()
 	ImGui::EndTabBar();
 }
 
-void ExponentialHeightFog::DrawGeneralSettings()
+void ExponentialHeightFog::DrawHeightFogSettings()
 {
 	ImGui::Checkbox(T(TKEY("use_vanilla_fog_settings"), "Follow Vanilla Fog"), (bool*)&settings.useVanillaFogSettings);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("use_vanilla_fog_settings_tooltip"), "Derives fog density, start distance, and colors from the active weather while keeping exponential height falloff. Weather Fog Strength scales density. Replaces vanilla distance fog."));
 	}
 	ImGui::BeginDisabled(settings.useVanillaFogSettings == 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("vanilla_strength"), "Weather Fog Strength"), this, "vanillaFogStrength", &settings.vanillaFogStrength, 0.0f, 4.0f, "%.2f");
-	Util::WeatherUI::SliderFloat(T(TKEY("lighting_influence"), "Weather Lighting Influence"), this, "fogLightingInfluence", &settings.fogLightingInfluence, 0.0f, 1.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("vanilla_strength"), "Weather Fog Strength"), &settings.vanillaFogStrength, 0.0f, 4.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("lighting_influence"), "Weather Lighting Influence"), &settings.fogLightingInfluence, 0.0f, 1.0f, "%.2f");
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(T(TKEY("density_height"), "Density and Height"));
 	ImGui::BeginDisabled(settings.useVanillaFogSettings != 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("fog_density"), "Fog Density"), this, "fogDensity", &settings.fogDensity, 0.0f, 1.0f, "%.3f");
-	Util::WeatherUI::SliderFloat(T(TKEY("start_distance"), "Start Distance"), this, "startDistance", &settings.startDistance, 0.0f, 100000.0f, "%.1f");
+	ImGui::SliderFloat(T(TKEY("fog_density"), "Fog Density"), &settings.fogDensity, 0.0f, 1.0f, "%.3f");
+	ImGui::SliderFloat(T(TKEY("start_distance"), "Start Distance"), &settings.startDistance, 0.0f, 100000.0f, "%.1f");
 	ImGui::EndDisabled();
-	Util::WeatherUI::SliderFloat(T(TKEY("fog_height"), "Fog Height"), this, "fogHeight", &settings.fogHeight, -22000.0f, 22000.0f, "%.1f");
-	Util::WeatherUI::SliderFloat(T(TKEY("fog_height_falloff"), "Fog Height Falloff"), this, "fogHeightFalloff", &settings.fogHeightFalloff, 0.001f, 2.0f, "%.3f");
+	ImGui::SliderFloat(T(TKEY("fog_height"), "Fog Height"), &settings.fogHeight, -22000.0f, 22000.0f, "%.1f");
+	ImGui::SliderFloat(T(TKEY("fog_height_falloff"), "Fog Height Falloff"), &settings.fogHeightFalloff, 0.001f, 2.0f, "%.3f");
 	if (ImGui::TreeNode(T(TKEY("second_fog_layer"), "Second Fog Layer"))) {
-		Util::WeatherUI::SliderFloat(T(TKEY("fog_height_2"), "Fog Height 2"), this, "fogHeight2", &settings.fogHeight2, -22000.0f, 22000.0f, "%.1f");
-		Util::WeatherUI::SliderFloat(T(TKEY("fog_height_falloff_2"), "Fog Height Falloff 2"), this, "fogHeightFalloff2", &settings.fogHeightFalloff2, 0.001f, 2.0f, "%.3f");
-		Util::WeatherUI::SliderFloat(T(TKEY("fog_density_2"), "Fog Density 2"), this, "fogDensity2", &settings.fogDensity2, 0.0f, 1.0f, "%.3f");
+		ImGui::SliderFloat(T(TKEY("fog_height_2"), "Fog Height 2"), &settings.fogHeight2, -22000.0f, 22000.0f, "%.1f");
+		ImGui::SliderFloat(T(TKEY("fog_height_falloff_2"), "Fog Height Falloff 2"), &settings.fogHeightFalloff2, 0.001f, 2.0f, "%.3f");
+		ImGui::SliderFloat(T(TKEY("fog_density_2"), "Fog Density 2"), &settings.fogDensity2, 0.0f, 1.0f, "%.3f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("%s", T(TKEY("second_fog_layer_tooltip"),
 								  "Adds a second stacked exponential height fog layer with its own base height, density and height falloff.\n"
@@ -280,21 +281,21 @@ void ExponentialHeightFog::DrawGeneralSettings()
 		ImGui::TreePop();
 	}
 	ImGui::BeginDisabled(settings.useVanillaFogSettings == 0 && settings.volumetricFogEnabled == 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("volumetric_extinction_scale"), "Extinction Scale"), this, "volumetricFogExtinctionScale", &settings.volumetricFogExtinctionScale, 0.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("volumetric_extinction_scale"), "Extinction Scale"), &settings.volumetricFogExtinctionScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("volumetric_extinction_scale_tooltip"), "Scales fog density when following vanilla fog, including when volumetric fog is off. In manual mode, affects only volumetric fog."));
 	}
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(T(TKEY("color_lighting"), "Color and Lighting"));
-	Util::WeatherUI::ColorEdit4(T(TKEY("fog_inscattering_color"), "Fog Inscattering Color"), this, "fogInscatteringColor", (float*)&settings.fogInscatteringColor);
+	ImGui::ColorEdit4(T(TKEY("fog_inscattering_color"), "Fog Inscattering Color"), (float*)&settings.fogInscatteringColor);
 	ImGui::BeginDisabled(settings.useVanillaFogSettings != 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("original_fog_color_amount"), "Original Fog Color Amount"), this, "originalFogColorAmount", &settings.originalFogColorAmount, 0.0f, 1.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("original_fog_color_amount"), "Original Fog Color Amount"), &settings.originalFogColorAmount, 0.0f, 1.0f, "%.2f");
 	ImGui::EndDisabled();
 	ImGui::BeginDisabled(settings.useVanillaFogSettings != 0 && settings.fogLightingInfluence <= 0.0f);
-	Util::WeatherUI::SliderFloat(T(TKEY("dir_inscattering_mul"), "Directional Light Inscattering Multiplier"), this, "directionalInscatteringMultiplier", &settings.directionalInscatteringMultiplier, 0.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("dir_inscattering_mul"), "Directional Light Inscattering Multiplier"), &settings.directionalInscatteringMultiplier, 0.0f, 10.0f, "%.2f");
 	ImGui::BeginDisabled(settings.directionalInscatteringMultiplier <= 0.0f);
-	Util::WeatherUI::SliderFloat(T(TKEY("dir_inscattering_anisotropy"), "Directional Light Inscattering Anisotropy"), this, "directionalInscatteringAnisotropy", &settings.directionalInscatteringAnisotropy, -0.99f, 0.99f, "%.3f");
+	ImGui::SliderFloat(T(TKEY("dir_inscattering_anisotropy"), "Directional Light Inscattering Anisotropy"), &settings.directionalInscatteringAnisotropy, -0.99f, 0.99f, "%.3f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("dir_inscattering_anisotropy_tooltip"),
 							  "Controls the asymmetry of inscattering via the Henyey-Greenstein phase function.\n"
@@ -302,7 +303,7 @@ void ExponentialHeightFog::DrawGeneralSettings()
 							  "Zero is isotropic. Negative values produce back scattering."));
 	}
 	ImGui::EndDisabled();
-	Util::WeatherUI::SliderFloat(T(TKEY("sunlight_attenuation"), "Sunlight Attenuation Amount"), this, "sunlightAttenuationAmount", &settings.sunlightAttenuationAmount, 0.0f, 1.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("sunlight_attenuation"), "Sunlight Attenuation Amount"), &settings.sunlightAttenuationAmount, 0.0f, 1.0f, "%.2f");
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(T(TKEY("vanilla_fog"), "Vanilla Fog"));
@@ -312,7 +313,7 @@ void ExponentialHeightFog::DrawGeneralSettings()
 		ImGui::Text("%s", T(TKEY("disable_vanilla_fog_tooltip"), "Disables the vanilla fog entirely. Only exponential height fog will be applied."));
 	}
 	ImGui::EndDisabled();
-	Util::WeatherUI::Checkbox(T(TKEY("apply_vanilla_fade"), "Apply Vanilla Fade"), this, "respectVanillaFogFade", (bool*)&settings.respectVanillaFogFade);
+	ImGui::Checkbox(T(TKEY("apply_vanilla_fade"), "Apply Vanilla Fade"), (bool*)&settings.respectVanillaFogFade);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("apply_vanilla_fade_tooltip"), "Applies vanilla fade brightness to exponential height fog."));
 	}
@@ -334,7 +335,7 @@ void ExponentialHeightFog::DrawGeneralSettings()
 	const bool hasCubemapInscattering = (settings.useSkyIBL != 0 && globals::features::ibl.loaded) ||
 	                                    (settings.useDynamicCubemaps != 0 && globals::features::dynamicCubemaps.loaded);
 	ImGui::BeginDisabled(!hasCubemapInscattering);
-	Util::WeatherUI::ColorEdit4(T(TKEY("inscattering_cubemap_tint"), "Inscattering Cubemap Tint"), this, "inscatteringTint", (float*)&settings.inscatteringTint);
+	ImGui::ColorEdit4(T(TKEY("inscattering_cubemap_tint"), "Inscattering Cubemap Tint"), (float*)&settings.inscatteringTint);
 	ImGui::BeginDisabled(settings.inscatteringTint.w <= 0.0f);
 	ImGui::SliderFloat(T(TKEY("cubemap_mip_level"), "Cubemap Mip Level"), &settings.cubemapMipLevel, 1.0f, 8.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::EndDisabled();
@@ -342,15 +343,15 @@ void ExponentialHeightFog::DrawGeneralSettings()
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(T(TKEY("distance_haze"), "Distance Haze"));
-	Util::WeatherUI::SliderFloat(T(TKEY("distance_haze_max_opacity"), "Haze Maximum Opacity"), this, "distanceHazeMaxOpacity", &settings.distanceHazeMaxOpacity, 0.0f, 1.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("distance_haze_max_opacity"), "Haze Maximum Opacity"), &settings.distanceHazeMaxOpacity, 0.0f, 1.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("distance_haze_max_opacity_tooltip"), "Adds haze at all heights using the fog colors above, while preserving dense height fog. Zero disables distance haze."));
 	}
-	Util::WeatherUI::SliderFloat(T(TKEY("distance_haze_start_distance"), "Haze Start Distance"), this, "distanceHazeStartDistance", &settings.distanceHazeStartDistance, 0.0f, kMaxDistanceHazeDistance, "%.0f");
+	ImGui::SliderFloat(T(TKEY("distance_haze_start_distance"), "Haze Start Distance"), &settings.distanceHazeStartDistance, 0.0f, kMaxDistanceHazeDistance, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("distance_haze_start_distance_tooltip"), "Horizontal distance from the camera where haze begins, in game units. Independent of height fog Start Distance."));
 	}
-	Util::WeatherUI::SliderFloat(T(TKEY("distance_haze_fade_distance"), "Haze Fade Distance"), this, "distanceHazeFadeDistance", &settings.distanceHazeFadeDistance, kMinDistanceHazeFadeDistance, kMaxDistanceHazeDistance, "%.0f");
+	ImGui::SliderFloat(T(TKEY("distance_haze_fade_distance"), "Haze Fade Distance"), &settings.distanceHazeFadeDistance, kMinDistanceHazeFadeDistance, kMaxDistanceHazeDistance, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("distance_haze_fade_distance_tooltip"), "Horizontal distance beyond Haze Start Distance over which haze smoothly reaches its maximum opacity, in game units."));
 	}
@@ -358,14 +359,14 @@ void ExponentialHeightFog::DrawGeneralSettings()
 
 void ExponentialHeightFog::DrawVolumetricSettings()
 {
-	Util::WeatherUI::Checkbox(T(TKEY("enable_volumetric_fog"), "Enable Volumetric Fog"), this, "volumetricFogEnabled", (bool*)&settings.volumetricFogEnabled);
+	ImGui::Checkbox(T(TKEY("enable_volumetric_fog"), "Enable Volumetric Fog"), (bool*)&settings.volumetricFogEnabled);
 	ImGui::BeginDisabled(settings.volumetricFogEnabled == 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("volumetric_view_distance"), "Volumetric View Distance"), this, "volumetricFogDistance", &settings.volumetricFogDistance, 1000.0f, 200000.0f, "%.0f");
+	ImGui::SliderFloat(T(TKEY("volumetric_view_distance"), "Volumetric View Distance"), &settings.volumetricFogDistance, 1000.0f, 200000.0f, "%.0f");
 	ImGui::BeginDisabled(settings.useVanillaFogSettings != 0);
-	Util::WeatherUI::SliderFloat(T(TKEY("volumetric_start_distance"), "Volumetric Start Distance"), this, "volumetricFogStartDistance", &settings.volumetricFogStartDistance, 0.0f, 20000.0f, "%.0f");
-	Util::WeatherUI::SliderFloat(T(TKEY("near_fade_in_distance"), "Near Fade In Distance"), this, "volumetricFogNearFadeInDistance", &settings.volumetricFogNearFadeInDistance, 0.0f, 20000.0f, "%.0f");
+	ImGui::SliderFloat(T(TKEY("volumetric_start_distance"), "Volumetric Start Distance"), &settings.volumetricFogStartDistance, 0.0f, 20000.0f, "%.0f");
+	ImGui::SliderFloat(T(TKEY("near_fade_in_distance"), "Near Fade In Distance"), &settings.volumetricFogNearFadeInDistance, 0.0f, 20000.0f, "%.0f");
 	ImGui::EndDisabled();
-	Util::WeatherUI::SliderFloat(T(TKEY("volumetric_near_grid_distance"), "Near Grid Distance"), this, "volumetricNearGridDistance", &settings.volumetricNearGridDistance, 256.0f, 50000.0f, "%.0f");
+	ImGui::SliderFloat(T(TKEY("volumetric_near_grid_distance"), "Near Grid Distance"), &settings.volumetricNearGridDistance, 256.0f, 50000.0f, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("%s", T(TKEY("volumetric_near_grid_distance_tooltip"),
 							  "Distance covered by the full-resolution near volume.\n"
@@ -373,8 +374,8 @@ void ExponentialHeightFog::DrawVolumetricSettings()
 							  "Smaller values improve near-field resolution; larger values move the low-resolution far volume farther away."));
 	}
 	if (ImGui::TreeNode(T(TKEY("volumetric_noise"), "Volumetric Noise"))) {
-		Util::WeatherUI::SliderFloat(T(TKEY("volumetric_noise_scale"), "Noise Scale"), this, "volumetricFogNoiseScale", &settings.volumetricFogNoiseScale, 0.0f, 0.01f, "%.6f");
-		Util::WeatherUI::SliderFloat(T(TKEY("volumetric_noise_threshold"), "Noise Threshold"), this, "volumetricFogNoiseThreshold", &settings.volumetricFogNoiseThreshold, 0.0f, 1.0f, "%.2f");
+		ImGui::SliderFloat(T(TKEY("volumetric_noise_scale"), "Noise Scale"), &settings.volumetricFogNoiseScale, 0.0f, 0.01f, "%.6f");
+		ImGui::SliderFloat(T(TKEY("volumetric_noise_threshold"), "Noise Threshold"), &settings.volumetricFogNoiseThreshold, 0.0f, 1.0f, "%.2f");
 		ImGui::SliderFloat3(T(TKEY("volumetric_noise_velocity"), "Noise Velocity"), &settings.volumetricFogNoiseVelocity.x, -1.0f, 1.0f, "%.3f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("%s", T(TKEY("volumetric_noise_tooltip"),
@@ -387,25 +388,25 @@ void ExponentialHeightFog::DrawVolumetricSettings()
 	}
 
 	ImGui::SeparatorText(T(TKEY("color_lighting"), "Color and Lighting"));
-	Util::WeatherUI::ColorEdit4(T(TKEY("volumetric_albedo"), "Volumetric Albedo"), this, "volumetricFogAlbedo", (float*)&settings.volumetricFogAlbedo);
-	Util::WeatherUI::ColorEdit4(T(TKEY("volumetric_emissive"), "Volumetric Emissive"), this, "volumetricFogEmissive", (float*)&settings.volumetricFogEmissive);
+	ImGui::ColorEdit4(T(TKEY("volumetric_albedo"), "Volumetric Albedo"), (float*)&settings.volumetricFogAlbedo);
+	ImGui::ColorEdit4(T(TKEY("volumetric_emissive"), "Volumetric Emissive"), (float*)&settings.volumetricFogEmissive);
 	ImGui::BeginDisabled(settings.useVanillaFogSettings != 0 && settings.fogLightingInfluence <= 0.0f);
-	Util::WeatherUI::SliderFloat(T(TKEY("directional_scattering_intensity"), "Directional Scattering Intensity"), this, "volumetricDirectionalScatteringIntensity", &settings.volumetricDirectionalScatteringIntensity, 0.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("directional_scattering_intensity"), "Directional Scattering Intensity"), &settings.volumetricDirectionalScatteringIntensity, 0.0f, 10.0f, "%.2f");
 	ImGui::BeginDisabled(settings.volumetricDirectionalScatteringIntensity <= 0.0f);
 	ImGui::SliderFloat(T(TKEY("directional_shadow_bias"), "Directional Shadow Bias"), &settings.volumetricShadowBias, 0.0f, 0.05f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
 	ImGui::EndDisabled();
-	Util::WeatherUI::SliderFloat(T(TKEY("sky_lighting_scattering_intensity"), "Sky Lighting Scattering Intensity"), this, "volumetricSkyLightingIntensity", &settings.volumetricSkyLightingIntensity, 0.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("sky_lighting_scattering_intensity"), "Sky Lighting Scattering Intensity"), &settings.volumetricSkyLightingIntensity, 0.0f, 10.0f, "%.2f");
 	ImGui::BeginDisabled(!globals::features::lightLimitFix.loaded);
-	Util::WeatherUI::SliderFloat(T(TKEY("local_light_scattering_intensity"), "Local Light Scattering Intensity"), this, "volumetricLocalLightScatteringIntensity", &settings.volumetricLocalLightScatteringIntensity, 0.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("local_light_scattering_intensity"), "Local Light Scattering Intensity"), &settings.volumetricLocalLightScatteringIntensity, 0.0f, 10.0f, "%.2f");
 	ImGui::EndDisabled();
 	const bool hasScattering = settings.volumetricDirectionalScatteringIntensity > 0.0f || settings.volumetricSkyLightingIntensity > 0.0f ||
 	                           (globals::features::lightLimitFix.loaded && settings.volumetricLocalLightScatteringIntensity > 0.0f);
 	ImGui::BeginDisabled(!hasScattering);
-	Util::WeatherUI::SliderFloat(T(TKEY("volumetric_scattering_distribution"), "Volumetric Scattering Distribution"), this, "volumetricFogScatteringDistribution", &settings.volumetricFogScatteringDistribution, -0.9f, 0.9f, "%.2f");
+	ImGui::SliderFloat(T(TKEY("volumetric_scattering_distribution"), "Volumetric Scattering Distribution"), &settings.volumetricFogScatteringDistribution, -0.9f, 0.9f, "%.2f");
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 
-	if (ImGui::TreeNode(T(TKEY("debug"), "Quality and Temporal Filtering"))) {
+	if (!SceneWidgetInterceptor::IsArmed() && ImGui::TreeNode(T(TKEY("debug"), "Quality and Temporal Filtering"))) {
 		uint32_t minGridPixelSize = 4;
 		uint32_t maxGridPixelSize = 64;
 		uint32_t minGridSizeZ = 16;
@@ -494,6 +495,10 @@ void ExponentialHeightFog::ClearShaderCache()
 	if (farIntegrationCS) {
 		farIntegrationCS->Release();
 		farIntegrationCS = nullptr;
+	}
+	if (fogIBLColorCS) {
+		fogIBLColorCS->Release();
+		fogIBLColorCS = nullptr;
 	}
 }
 
@@ -847,8 +852,78 @@ ID3D11ComputeShader* ExponentialHeightFog::GetFarIntegrationCS()
 	return farIntegrationCS;
 }
 
+ID3D11ComputeShader* ExponentialHeightFog::GetFogIBLColorCS()
+{
+	if (!fogIBLColorCS)
+		fogIBLColorCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\ExponentialHeightFog\\FogIBLColorCS.hlsl", {}, "cs_5_0"));
+	return fogIBLColorCS;
+}
+
+void ExponentialHeightFog::UpdateFogIBLColor()
+{
+	auto* shader = GetFogIBLColorCS();
+	if (!shader)
+		return;
+
+	auto context = globals::d3d::context;
+	if (!fogIBLColor) {
+		D3D11_TEXTURE2D_DESC desc{};
+		desc.Width = 1;
+		desc.Height = 1;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		fogIBLColor = std::make_unique<Texture2D>(desc, "ExponentialHeightFog::FogIBLColor");
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = desc.Format;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		fogIBLColor->CreateSRV(srvDesc);
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = desc.Format;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		fogIBLColor->CreateUAV(uavDesc);
+	}
+
+	ID3D11ShaderResourceView* nullView = nullptr;
+	context->PSSetShaderResources(21, 1, &nullView);
+
+	ID3D11ShaderResourceView* iblViews[2]{};
+	context->PSGetShaderResources(76, 2, iblViews);
+	context->CSSetShaderResources(76, 2, iblViews);
+	for (auto* view : iblViews) {
+		if (view)
+			view->Release();
+	}
+
+	ID3D11Buffer* sharedBuffers[2]{ globals::state->sharedDataCB->CB(), globals::state->featureDataCB->CB() };
+	context->CSSetConstantBuffers(5, 2, sharedBuffers);
+	ID3D11Buffer* frameBuffers[1]{ *globals::game::perFrame.get() };
+	context->CSSetConstantBuffers(12, 1, frameBuffers);
+
+	ID3D11UnorderedAccessView* uav = fogIBLColor->uav.get();
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch(1, 1, 1);
+
+	ID3D11UnorderedAccessView* nullUAV = nullptr;
+	context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+	ID3D11ShaderResourceView* nullViews[2]{};
+	context->CSSetShaderResources(76, 2, nullViews);
+	context->CSSetShader(nullptr, nullptr, 0);
+
+	ID3D11ShaderResourceView* view = fogIBLColor->srv.get();
+	context->PSSetShaderResources(21, 1, &view);
+}
+
 void ExponentialHeightFog::Prepass()
 {
+	if (settings.enabled && globals::features::ibl.loaded && !IsSuppressed())
+		UpdateFogIBLColor();
+
 	if (!settings.enabled || !settings.volumetricFogEnabled || settings.volumetricFogExtinctionScale <= 0.0f) {
 		ReleaseVolumetricResources();
 		return;
@@ -866,7 +941,14 @@ void ExponentialHeightFog::Prepass()
 	const Settings frameSettings = GetCommonBufferData();
 	const float fogDensity = frameSettings.useVanillaFogSettings ? frameSettings.vanillaFogDensity * frameSettings.vanillaFogStrength : frameSettings.fogDensity;
 	if (fogDensity <= 0.0f && frameSettings.fogDensity2 <= 0.0f) {
-		ReleaseVolumetricResources();
+		hasLightScatteringHistory = false;
+		hasConservativeDepthHistory = false;
+		hasLightScatteringFarHistory = false;
+		hasConservativeDepthFarHistory = false;
+		lastPrepassFrame = UINT32_MAX;
+		ID3D11ShaderResourceView* nullViews[1] = { nullptr };
+		globals::d3d::context->PSSetShaderResources(19, 1, nullViews);
+		globals::d3d::context->PSSetShaderResources(22, 1, nullViews);
 		return;
 	}
 
@@ -1206,290 +1288,5 @@ void ExponentialHeightFog::Prepass()
 
 	lastPrepassFrame = globals::state->frameCount;
 	BindIntegratedLightScattering();
-}
-
-void ExponentialHeightFog::RegisterWeatherVariables()
-{
-	auto* registry = WeatherVariables::GlobalWeatherRegistry::GetSingleton()->GetOrCreateFeatureRegistry(GetShortName());
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"startDistance",
-		"Start Distance",
-		"Start distance of the fog, from the camera",
-		&settings.startDistance,
-		0.0f,
-		0.0f, 100000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogHeight",
-		"Fog Height",
-		"Base height of the fog effect",
-		&settings.fogHeight,
-		0.0f,
-		-22000.0f, 22000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogHeightFalloff",
-		"Fog Height Falloff",
-		"Height density factor controls how the density increases as height decreases",
-		&settings.fogHeightFalloff,
-		0.2f,
-		0.001f, 2.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::Float4Variable>(
-		"fogInscatteringColor",
-		"Fog Inscattering Color",
-		"Color added to the fog inscattering contribution",
-		&settings.fogInscatteringColor,
-		float4{ 0.0f, 0.0f, 0.0f, 1.0f }));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"originalFogColorAmount",
-		"Original Fog Color Amount",
-		"Amount of the original fog color added to fog inscattering",
-		&settings.originalFogColorAmount,
-		1.0f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogDensity",
-		"Fog Density",
-		"Overall density of the fog",
-		&settings.fogDensity,
-		0.02f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogHeight2",
-		"Fog Height 2",
-		"Base height of the second fog layer",
-		&settings.fogHeight2,
-		0.0f,
-		-22000.0f, 22000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogHeightFalloff2",
-		"Fog Height Falloff 2",
-		"Height density factor of the second fog layer controlling how the density increases as height decreases",
-		&settings.fogHeightFalloff2,
-		0.2f,
-		0.001f, 2.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogDensity2",
-		"Fog Density 2",
-		"Overall density of the second fog layer",
-		&settings.fogDensity2,
-		0.0f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"directionalInscatteringMultiplier",
-		"Directional Inscattering Multiplier",
-		"Multiplier for directional light inscattering",
-		&settings.directionalInscatteringMultiplier,
-		1.0f,
-		0.0f, 10.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"sunlightAttenuationAmount",
-		"Sunlight Attenuation Amount",
-		"Amount of fog attenuation applied to direct sunlight",
-		&settings.sunlightAttenuationAmount,
-		1.0f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"directionalInscatteringAnisotropy",
-		"Directional Inscattering Anisotropy",
-		"Henyey-Greenstein asymmetry parameter. Positive = forward scattering, 0 = isotropic, negative = back scattering.",
-		&settings.directionalInscatteringAnisotropy,
-		0.2f,
-		-0.99f, 0.99f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::Float4Variable>(
-		"inscatteringTint",
-		"Inscattering Cubemap Tint",
-		"RGB tint for the inscattering cubemap with alpha for intensity",
-		&settings.inscatteringTint,
-		float4{ 1.0f, 1.0f, 1.0f, 1.0f }));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::WeatherVariable<bool>>(
-		"respectVanillaFogFade",
-		"Apply Vanilla Fade",
-		"Apply vanilla fade brightness to exponential height fog",
-		(bool*)&settings.respectVanillaFogFade,
-		false,
-		[](const bool& from, const bool& to, float factor) {
-			return factor > 0.5f ? to : from;
-		}));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::WeatherVariable<bool>>(
-		"disableVanillaFog",
-		"Disable Vanilla Fog",
-		"Disables vanilla fog entirely, only exponential height fog is applied",
-		(bool*)&settings.disableVanillaFog,
-		false,
-		[](const bool& from, const bool& to, float factor) {
-			return factor > 0.5f ? to : from;
-		}));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::WeatherVariable<bool>>(
-		"volumetricFogEnabled",
-		"Enable Volumetric Fog",
-		"Enables froxel-based volumetric fog for exponential height fog",
-		(bool*)&settings.volumetricFogEnabled,
-		false,
-		[](const bool& from, const bool& to, float factor) {
-			return factor > 0.5f ? to : from;
-		}));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogDistance",
-		"Volumetric View Distance",
-		"Maximum distance covered by exponential height volumetric fog",
-		&settings.volumetricFogDistance,
-		60000.0f,
-		1000.0f, 200000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricNearGridDistance",
-		"Volumetric Near Grid Distance",
-		"Distance covered by the full-resolution near volume; a quarter-lattice far volume covers the rest",
-		&settings.volumetricNearGridDistance,
-		8000.0f,
-		256.0f, 50000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogNoiseScale",
-		"Volumetric Fog Noise Scale",
-		"Spatial frequency of the volumetric fog noise field (0 = disabled)",
-		&settings.volumetricFogNoiseScale,
-		0.0f,
-		0.0f, 0.01f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogNoiseThreshold",
-		"Volumetric Fog Noise Threshold",
-		"Soft cutoff that carves clumps out of the volumetric fog noise field",
-		&settings.volumetricFogNoiseThreshold,
-		0.5f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::Float3Variable>(
-		"volumetricFogNoiseVelocity",
-		"Volumetric Fog Noise Velocity",
-		"Animation drift of the volumetric fog noise field",
-		&settings.volumetricFogNoiseVelocity,
-		float3{ 0.0f, 0.0f, 0.0f }));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogStartDistance",
-		"Volumetric Start Distance",
-		"Start distance of volumetric fog from the camera",
-		&settings.volumetricFogStartDistance,
-		0.0f,
-		0.0f, 200000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogNearFadeInDistance",
-		"Volumetric Near Fade In Distance",
-		"Distance over which volumetric fog fades in near the camera",
-		&settings.volumetricFogNearFadeInDistance,
-		1000.0f,
-		0.0f, 20000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogExtinctionScale",
-		"Volumetric Extinction Scale",
-		"Scale applied to volumetric fog extinction",
-		&settings.volumetricFogExtinctionScale,
-		1.0f,
-		0.0f, 10.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricFogScatteringDistribution",
-		"Volumetric Scattering Distribution",
-		"Henyey-Greenstein scattering distribution for volumetric fog",
-		&settings.volumetricFogScatteringDistribution,
-		0.2f,
-		-0.9f, 0.9f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricDirectionalScatteringIntensity",
-		"Volumetric Directional Scattering Intensity",
-		"Scale applied to volumetric fog directional light scattering",
-		&settings.volumetricDirectionalScatteringIntensity,
-		1.0f,
-		0.0f, 10.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::Float4Variable>(
-		"volumetricFogAlbedo",
-		"Volumetric Albedo",
-		"Volumetric fog albedo color",
-		&settings.volumetricFogAlbedo,
-		float4{ 1.0f, 1.0f, 1.0f, 1.0f }));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::Float4Variable>(
-		"volumetricFogEmissive",
-		"Volumetric Emissive",
-		"Volumetric fog emissive color",
-		&settings.volumetricFogEmissive,
-		float4{ 0.0f, 0.0f, 0.0f, 0.0f }));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricSkyLightingIntensity",
-		"Volumetric Sky Lighting Intensity",
-		"Scale applied to volumetric fog sky lighting",
-		&settings.volumetricSkyLightingIntensity,
-		1.0f,
-		0.0f, 10.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"volumetricLocalLightScatteringIntensity",
-		"Volumetric Local Light Scattering Intensity",
-		"Scale applied to volumetric fog local light scattering",
-		&settings.volumetricLocalLightScatteringIntensity,
-		1.0f,
-		0.0f, 100.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"vanillaFogStrength",
-		"Weather Fog Strength",
-		"Scales the fog density derived from the active weather when following vanilla fog",
-		&settings.vanillaFogStrength,
-		1.25f,
-		0.0f, 4.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"fogLightingInfluence",
-		"Weather Lighting Influence",
-		"How strongly sun, sky and local lights shape fog that follows vanilla fog",
-		&settings.fogLightingInfluence,
-		0.35f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"distanceHazeMaxOpacity",
-		"Haze Maximum Opacity",
-		"Maximum opacity of distance haze added at all heights",
-		&settings.distanceHazeMaxOpacity,
-		0.0f,
-		0.0f, 1.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"distanceHazeStartDistance",
-		"Haze Start Distance",
-		"Horizontal distance from the camera where distance haze begins",
-		&settings.distanceHazeStartDistance,
-		15000.0f,
-		0.0f, 200000.0f));
-
-	registry->RegisterVariable(std::make_shared<WeatherVariables::FloatVariable>(
-		"distanceHazeFadeDistance",
-		"Haze Fade Distance",
-		"Distance over which distance haze reaches its maximum opacity",
-		&settings.distanceHazeFadeDistance,
-		60000.0f,
-		1.0f, 200000.0f));
 }
 #undef I18N_KEY_PREFIX

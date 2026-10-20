@@ -29,7 +29,8 @@ struct LightLimitFix : OverlayFeature
 	struct VertexColorCacheEntry
 	{
 		bool valid = false;
-		bool applyEffectMaterialTint = true;
+		bool colorManagementEnabled = false;
+		bool acescgEnabled = false;
 		ParticleLightConfig config{};
 		RE::NiColorA baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
 	};
@@ -42,6 +43,7 @@ struct LightLimitFix : OverlayFeature
 	std::shared_mutex particleLightsMutex;
 
 	bool CheckParticleLights(RE::BSRenderPass* a_pass, uint32_t a_technique);
+	bool IsParticleLightEmitter(RE::BSGeometry* a_geometry);
 
 public:
 	virtual inline std::string GetName() override { return "Light Limit Fix"; }
@@ -258,6 +260,8 @@ public:
 	/** @brief Populates and returns the per-frame constant buffer data for light visualization settings. */
 	PerFrame GetCommonBufferData();
 
+	bool AreContactShadowsCompiled();
+
 	struct alignas(16) StrictLightDataCB
 	{
 		uint NumStrictLights;
@@ -289,6 +293,7 @@ public:
 	eastl::unique_ptr<Buffer> lightGrid = nullptr;
 
 	std::uint32_t lightCount = 0;
+	std::uint32_t particleLightCount = 0;
 	float lightsNear = 1;
 	float lightsFar = 16384;
 
@@ -460,7 +465,7 @@ public:
 		bool EnableParticleLightsCulling = true;
 		bool EnableLightsVisualisation = false;
 		uint LightsVisualisationMode = 0;
-		bool EnableContactShadows = true;
+		bool EnableContactShadows = false;
 		uint ContactShadowMaxSteps = 4;
 		float ContactShadowMaxDistance = 1024.0f;
 		float ContactShadowLength = 8.0f;
@@ -534,6 +539,7 @@ public:
 		using RenderPass1 = BSBatchRenderer_RenderPassImmediately<1>;
 		using RenderPass2 = BSBatchRenderer_RenderPassImmediately<2>;
 		using RenderPass3 = BSBatchRenderer_RenderPassImmediately<3>;
+		using RenderPass4 = BSBatchRenderer_RenderPassImmediately<4>;
 
 		struct BSGeometry_Destroy
 		{
@@ -614,6 +620,9 @@ public:
 	};
 
 private:
+	bool contactShadowsLatched = false;
+	bool contactShadowsAtBoot = false;
+
 	static constexpr float DefaultCutoff = 0.05f;
 	static constexpr float DefaultShadowCasterCutoff = 0.022f;
 
@@ -627,7 +636,7 @@ private:
 
 	static inline float SmoothStep(float edge0, float edge1, float x);
 
-	VertexColorCacheEntry GetParticleLightConfig(RE::BSRenderPass* a_pass);
+	VertexColorCacheEntry GetParticleLightConfig(RE::BSGeometry* a_geometry, RE::BSShaderProperty* a_shaderProperty);
 	bool QueueParticleLight(RE::BSRenderPass* a_pass, VertexColorCacheEntry& a_reference);
 };
 

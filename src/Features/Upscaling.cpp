@@ -20,6 +20,8 @@
 #include <directx/d3dx12.h>
 #include <format>
 
+#include "Features/PostProcessing.h"
+
 #define I18N_KEY_PREFIX "feature.upscaling."
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -46,15 +48,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
-/**
- * @brief One-shot migration of fsr4RuntimeEnable for the detected adapter's FSR4 support class.
- *
- * RX 7000 (RDNA3 discrete) eligibility was added after fsr4RuntimeEnable already shipped
- * defaulting to off; auto-enable it once for those adapters so existing/new RX 7000 users
- * get the same experience as a fresh RX 9000 install. Leaves the user's own choice alone on
- * RX 9000 (already eligible pre-migration) and on Unsupported adapters, where the version is
- * deliberately left unstamped so the migration re-runs once a supported adapter is detected.
- */
 void ApplyLegacyFsr4RuntimeSelectionMigration(Upscaling::Settings& a_settings, FidelityFX::Fsr4AdapterSupport a_adapterSupport)
 {
 	if (a_settings.fsr4RuntimeSelectionSchemaVersion >= Upscaling::kFsr4RuntimeSelectionSchemaVersion)
@@ -62,11 +55,6 @@ void ApplyLegacyFsr4RuntimeSelectionMigration(Upscaling::Settings& a_settings, F
 
 	if (a_adapterSupport == FidelityFX::Fsr4AdapterSupport::Unsupported)
 		return;
-
-	if (a_adapterSupport == FidelityFX::Fsr4AdapterSupport::RadeonRx7000 && !a_settings.fsr4RuntimeEnable) {
-		a_settings.fsr4RuntimeEnable = true;
-		logger::info("[Upscaling] Auto-enabled Runtime FSR4 for detected RX 7000-class adapter");
-	}
 
 	a_settings.fsr4RuntimeSelectionSchemaVersion = Upscaling::kFsr4RuntimeSelectionSchemaVersion;
 }
@@ -516,6 +504,10 @@ void Upscaling::DrawSettings()
 void Upscaling::SaveSettings(json& o_json)
 {
 	o_json = settings;
+}
+
+void Upscaling::WriteGameIniSettings()
+{
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
 		auto setting = iniSettingCollection->GetSetting("bUseTAA:Display");
@@ -1796,19 +1788,18 @@ void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 
 void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32_t a3, RE::RENDER_TARGET a_target, void* a_4, bool a_5)
 {
+	auto& postProcessing = globals::features::postProcessing;
+	if (postProcessing.loaded) {
+		postProcessing.DrawBeforeUpscaling();
+	}
+
 	auto& upscaling = globals::features::upscaling;
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
 
-	// Decide frame generation once per frame, here, and hold that decision through Present.
-	// Re-evaluating at Present let loading transitions flip the answer in between, so Present
-	// interpolated with inputs that were never copied and flashed a stale frame.
-	upscaling.frameGenerationPrepared = false;
-	if (upscaling.ShouldPrepareFrameGeneration()) {
-		auto& postProcessing = globals::features::postProcessing;
-		if (postProcessing.loaded)
-			postProcessing.ClearBorderMotionVectorsForFrameGen();
-		upscaling.frameGenerationPrepared = upscaling.CopySharedD3D12Resources();
-	}
+	const bool prepareFrameGeneration = upscaling.ShouldPrepareFrameGeneration();
+	if (prepareFrameGeneration && postProcessing.loaded)
+		postProcessing.ClearBorderMotionVectorsForFrameGen();
+	upscaling.frameGenerationPrepared = prepareFrameGeneration && upscaling.CopySharedD3D12Resources();
 
 	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA)
 		upscaling.PerformUpscaling();

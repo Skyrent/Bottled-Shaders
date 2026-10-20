@@ -1,9 +1,10 @@
 #include "ScreenSpaceShadows.h"
-#include "Features/ReverseZ.h"
 
+#include <DirectXTex.h>
+
+#include "Features/ReverseZ.h"
 #include "Features/TerrainBlending.h"
 #include "I18n/I18n.h"
-#include "ShaderCache.h"
 #include "State.h"
 #include "Utils/D3D.h"
 
@@ -20,10 +21,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpaceShadows::BendSettings,
 	Enable,
 	SampleCount,
-	AdaptiveReach,
 	SurfaceThickness,
 	BilinearThreshold,
-	ShadowContrast)
+	ShadowContrast,
+	FilterShadowMask)
 
 void ScreenSpaceShadows::DrawSettings()
 {
@@ -35,13 +36,6 @@ void ScreenSpaceShadows::DrawSettings()
 		ImGui::SliderInt(T(TKEY("sample_count"), "Sample Count Multiplier"), (int*)&bendSettings.SampleCount, 1, 4, "%d", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("%s", T(TKEY("sample_count_tooltip"), "Multiplier for shadow ray sample count. Higher values increase shadow reach at the cost of performance. Adapts to render resolution."));
-
-		ImGui::Checkbox(T(TKEY("adaptive_reach"), "Adaptive Reach"), (bool*)&bendSettings.AdaptiveReach);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("%s", T(TKEY("adaptive_reach_tooltip"), "Scales the ray length with the sun's angle to the view direction so shadows keep a similar reach as the camera turns: longer when the sun is to the side and shadows stretch across the screen, shorter when the sun is ahead or behind. Ray length is a per-pixel sweep, so the cost barely changes."));
-		ImGui::Text(T(TKEY("ray_length"), "Ray length: %u samples (reach x%.2f)"), lastCompiledSampleCount, lastReachScale);
-		if (lastRequestedSampleCount != 0 && lastCompiledSampleCount != lastRequestedSampleCount && IsRaymarchPending(lastRequestedSampleCount))
-			ImGui::Text(T(TKEY("ray_length_compiling"), "Compiling %u samples in the background"), lastRequestedSampleCount);
 
 		ImGui::SliderFloat(T(TKEY("surface_thickness"), "Surface Thickness"), &bendSettings.SurfaceThickness, 0.005f, 0.05f);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -55,6 +49,10 @@ void ScreenSpaceShadows::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("%s", T(TKEY("shadow_contrast_tooltip"), "Contrast boost for the shadow transition. Higher values produce harder shadow edges."));
 
+		ImGui::Checkbox(T(TKEY("filter_shadow_mask"), "Filter Shadow Mask"), (bool*)&bendSettings.FilterShadowMask);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("%s", T(TKEY("filter_shadow_mask_tooltip"), "Applies a depth-aware blur to the sun and light shadow mask, softening shadow map aliasing without bleeding across object edges."));
+
 		ImGui::Spacing();
 		ImGui::Spacing();
 		ImGui::TreePop();
@@ -63,19 +61,28 @@ void ScreenSpaceShadows::DrawSettings()
 
 void ScreenSpaceShadows::InvalidateRaymarchShaders()
 {
-	std::lock_guard lock(raymarchMutex);
-	++raymarchGeneration;
-	raymarchVariants.clear();
-	lastCompiledSampleCount = 0;
-	lastRequestedSampleCount = 0;
+	if (raymarchCS) {
+		raymarchCS->Release();
+		raymarchCS = nullptr;
+	}
 }
 
 void ScreenSpaceShadows::ClearShaderCache()
 {
 	InvalidateRaymarchShaders();
+	if (shadowMaskFilterCS) {
+		shadowMaskFilterCS->Release();
+		shadowMaskFilterCS = nullptr;
+	}
+	shadowMaskFilterCompileFailed = false;
 }
 
-uint ScreenSpaceShadows::GetScaledSampleCount(float a_reachScale)
+void ScreenSpaceShadows::OnShadowMaskRendered()
+{
+	shadowMaskFrame = globals::state->frameCount;
+}
+
+uint ScreenSpaceShadows::GetScaledSampleCount()
 {
 	float2 renderSize = Util::ConvertToDynamic(float2{ (float)globals::game::graphicsState->screenWidth, (float)globals::game::graphicsState->screenHeight });
 
@@ -84,162 +91,138 @@ uint ScreenSpaceShadows::GetScaledSampleCount(float a_reachScale)
 	float referenceArea = referenceRes.x * referenceRes.y;
 	float currentArea = renderSize.x * renderSize.y;
 	float areaScale = std::sqrt(currentArea / referenceArea);
-	uint scaledSampleCount = static_cast<uint>(std::round(std::clamp(bendSettings.SampleCount, 1u, 4u) * 60 * areaScale * a_reachScale));
+	uint scaledSampleCount = static_cast<uint>(std::round(std::clamp(bendSettings.SampleCount, 1u, 4u) * 60 * areaScale));
 
 	// Quantize to steps of 8 to prevent frequent recompilation from small DRS oscillations
 	scaledSampleCount = ((scaledSampleCount + 7u) / 8u) * 8u;
-	scaledSampleCount = std::clamp(scaledSampleCount, 8u, 1024u);
+	scaledSampleCount = std::max(scaledSampleCount, 8u);
 
 	return scaledSampleCount;
 }
 
-float ScreenSpaceShadows::GetAdaptiveReachScale(const float3& a_lightDirection)
+ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarch()
 {
-	if (!bendSettings.AdaptiveReach) {
-		reachBand = 0;
-		return 1.0f;
+	uint scaledSampleCount = GetScaledSampleCount();
+
+	if (scaledSampleCount != lastCompiledSampleCount) {
+		lastCompiledSampleCount = scaledSampleCount;
+		InvalidateRaymarchShaders();
 	}
 
-	// Screen-space shadow length scales with the light direction's component across the view axis.
-	// The reference of 0.5 keeps the unmodified ray length at a 30 degree sun-to-view angle.
-	auto viewMat = globals::game::frameBufferCached.GetCameraView().Transpose();
-	auto lightVS = DirectX::SimpleMath::Vector4::Transform(float4(a_lightDirection.x, a_lightDirection.y, a_lightDirection.z, 0.0f), viewMat);
-	const float length = std::sqrt(lightVS.x * lightVS.x + lightVS.y * lightVS.y + lightVS.z * lightVS.z);
-	if (length <= 1e-6f)
-		return 1.0f;
-	const float across = std::sqrt(lightVS.x * lightVS.x + lightVS.y * lightVS.y) / length;
-	constexpr float kReferenceAcross = 0.5f;
-	return std::clamp(across / kReferenceAcross, 0.5f, 2.0f);
-}
-
-uint ScreenSpaceShadows::SelectSampleCount(float a_reachScale)
-{
-	// Bands are powers of sqrt(2) between 0.5x and 2x: five variants per base count. A band only changes once
-	// the continuous value has moved 15 percent past the boundary, so a sun drifting along a boundary holds still.
-	constexpr int kMinBand = -2;
-	constexpr int kMaxBand = 2;
-	constexpr float kHysteresis = 0.15f;
-	const float continuous = std::clamp(std::log2(std::max(a_reachScale, 0.5f)) * 2.0f, (float)kMinBand, (float)kMaxBand);
-	if (lastRequestedSampleCount == 0)
-		reachBand = std::clamp((int)std::lround(continuous), kMinBand, kMaxBand);
-	else if (continuous > (float)reachBand + 0.5f + kHysteresis)
-		reachBand = std::min(reachBand + 1, kMaxBand);
-	else if (continuous < (float)reachBand - 0.5f - kHysteresis)
-		reachBand = std::max(reachBand - 1, kMinBand);
-	lastReachScale = std::exp2((float)reachBand * 0.5f);
-
-	const uint target = GetScaledSampleCount(lastReachScale);
-	// Two quantisation steps of hysteresis so DRS jitter does not flip variants every frame.
-	if (lastRequestedSampleCount != 0) {
-		const uint delta = target > lastRequestedSampleCount ? target - lastRequestedSampleCount : lastRequestedSampleCount - target;
-		if (delta < 16)
-			return lastRequestedSampleCount;
+	if (!raymarchCS) {
+		auto sampleCount = std::format("{}", scaledSampleCount);
+		std::vector<std::pair<const char*, const char*>> defines{ { "SAMPLE_COUNT", sampleCount.c_str() } };
+		// TERRAIN_BLENDING flips DepthTexture's HLSL type from `Texture2D<unorm float>`
+		// (R24_UNORM_X8_TYPELESS game depth) to `Texture2D<float>` (R32_FLOAT blendedDepth).
+		if (globals::features::terrainBlending.loaded)
+			defines.push_back({ "TERRAIN_BLENDING", "" });
+		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
 	}
-	lastRequestedSampleCount = target;
-	return target;
+	return raymarchCS;
 }
 
-void ScreenSpaceShadows::RequestRaymarch(uint a_sampleCount)
+ID3D11ComputeShader* ScreenSpaceShadows::GetShadowMaskFilterCS()
 {
-	if (!globals::shaderCache)
-		return;
-
-	std::vector<std::pair<const char*, const char*>> defines;
-	uint generation = 0;
-	{
-		std::lock_guard lock(raymarchMutex);
-		auto [it, inserted] = raymarchVariants.try_emplace(a_sampleCount);
-		if (!inserted)
-			return;
-		it->second.pending = true;
-		generation = raymarchGeneration;
-
-		// Define strings must outlive the compile, so sample count texts are kept for the whole session.
-		const std::string& text = raymarchSampleCountTexts.try_emplace(a_sampleCount, std::format("{}", a_sampleCount)).first->second;
-		defines.push_back({ "SAMPLE_COUNT", text.c_str() });
-	}
-	// TERRAIN_BLENDING flips DepthTexture's HLSL type from `Texture2D<unorm float>`
-	// (R24_UNORM_X8_TYPELESS game depth) to `Texture2D<float>` (R32_FLOAT blendedDepth).
-	if (globals::features::terrainBlending.loaded)
-		defines.push_back({ "TERRAIN_BLENDING", "" });
-
-	globals::shaderCache->EnqueueStandaloneShaderCompile(
-		L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", "main", std::move(defines),
-		SIE::ShaderCache::StandaloneShaderClass::Compute,
-		[this, a_sampleCount, generation](ID3D11DeviceChild* a_shader) {
-			std::lock_guard lock(raymarchMutex);
-			auto found = raymarchVariants.find(a_sampleCount);
-			if (generation != raymarchGeneration || found == raymarchVariants.end() || !found->second.pending) {
-				if (a_shader)
-					a_shader->Release();
-				return;
-			}
-			found->second.pending = false;
-			found->second.failed = a_shader == nullptr;
-			if (a_shader)
-				found->second.shader.attach(static_cast<ID3D11ComputeShader*>(a_shader));
-		});
-}
-
-bool ScreenSpaceShadows::IsRaymarchPending(uint a_sampleCount)
-{
-	std::lock_guard lock(raymarchMutex);
-	auto it = raymarchVariants.find(a_sampleCount);
-	return it != raymarchVariants.end() && it->second.pending;
-}
-
-void ScreenSpaceShadows::PrefetchRaymarchVariants()
-{
-	if (!bendSettings.AdaptiveReach) {
-		RequestRaymarch(GetScaledSampleCount(1.0f));
-		return;
-	}
-	for (int band = -2; band <= 2; ++band)
-		RequestRaymarch(GetScaledSampleCount(std::exp2((float)band * 0.5f)));
-}
-
-ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarch(uint a_sampleCount, uint& a_usedSampleCount)
-{
-	RequestRaymarch(a_sampleCount);
-
-	std::lock_guard lock(raymarchMutex);
-	if (auto it = raymarchVariants.find(a_sampleCount); it != raymarchVariants.end() && it->second.shader) {
-		a_usedSampleCount = a_sampleCount;
-		return it->second.shader.get();
-	}
-
-	ID3D11ComputeShader* nearest = nullptr;
-	uint nearestDistance = UINT32_MAX;
-	for (auto& [sampleCount, variant] : raymarchVariants) {
-		if (!variant.shader)
-			continue;
-		const uint distance = sampleCount > a_sampleCount ? sampleCount - a_sampleCount : a_sampleCount - sampleCount;
-		if (distance < nearestDistance) {
-			nearestDistance = distance;
-			nearest = variant.shader.get();
-			a_usedSampleCount = sampleCount;
+	if (!shadowMaskFilterCS && !shadowMaskFilterCompileFailed) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (globals::features::terrainBlending.loaded)
+			defines.push_back({ "TERRAIN_BLENDING", "" });
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		if (filteredShadowMaskTexture && filteredShadowMaskTexture->uav)
+			filteredShadowMaskTexture->uav->GetDesc(&uavDesc);
+		if (DirectX::FormatDataType(uavDesc.Format) == DirectX::FORMAT_TYPE_UNORM)
+			defines.push_back({ "SHADOW_MASK_UNORM", "" });
+		shadowMaskFilterCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\ShadowMaskFilterCS.hlsl", defines, "cs_5_0");
+		if (!shadowMaskFilterCS) {
+			logger::error("[SSS] Failed to compile the shadow mask filter shader, shadow mask filtering disabled");
+			shadowMaskFilterCompileFailed = true;
 		}
 	}
-	if (nearest)
-		return nearest;
+	return shadowMaskFilterCS;
+}
 
-	// Nothing has finished yet: the background pool serves the main shader queue first, which can take minutes on
-	// a fresh cache, so the very first variant is compiled here once. Later variants always arrive in the background.
-	auto& variant = raymarchVariants[a_sampleCount];
-	if (variant.failed)
-		return nullptr;
-	const std::string& text = raymarchSampleCountTexts.try_emplace(a_sampleCount, std::format("{}", a_sampleCount)).first->second;
-	std::vector<std::pair<const char*, const char*>> defines{ { "SAMPLE_COUNT", text.c_str() } };
-	if (globals::features::terrainBlending.loaded)
-		defines.push_back({ "TERRAIN_BLENDING", "" });
-	auto* shader = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0"));
-	variant.pending = false;
-	variant.failed = shader == nullptr;
+void ScreenSpaceShadows::FilterShadowMask()
+{
+	auto renderer = globals::game::renderer;
+	if (!filteredShadowMaskTexture || !renderer)
+		return;
+
+	auto& shadowMask = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+	auto* depthSRV = Util::GetCurrentSceneDepthSRV(false);
+	if (!shadowMask.texture || !shadowMask.SRV || !depthSRV)
+		return;
+
+	auto shader = GetShadowMaskFilterCS();
 	if (!shader)
-		return nullptr;
-	variant.shader.attach(shader);
-	a_usedSampleCount = a_sampleCount;
-	return shader;
+		return;
+
+	ZoneScopedS(8);
+	TracyD3D11Zone(globals::state->tracyCtx, "SSS - Shadow Mask Filter");
+	globals::profiler->BeginPass("ScreenSpaceShadows::ShadowMaskFilter");
+
+	auto context = globals::d3d::context;
+
+	D3D11_TEXTURE2D_DESC maskDesc{};
+	shadowMask.texture->GetDesc(&maskDesc);
+
+	D3D11_TEXTURE2D_DESC depthDesc{};
+	{
+		winrt::com_ptr<ID3D11Resource> depthResource;
+		depthSRV->GetResource(depthResource.put());
+		winrt::com_ptr<ID3D11Texture2D> depthTexture;
+		if (depthResource && depthResource.try_as(depthTexture) && depthTexture)
+			depthTexture->GetDesc(&depthDesc);
+	}
+	if (!depthDesc.Width || !depthDesc.Height)
+		depthDesc = maskDesc;
+
+	const float2 maskSize = { (float)maskDesc.Width, (float)maskDesc.Height };
+	const float2 renderSize = Util::ConvertToDynamic(maskSize, true);
+	const uint copyWidth = std::min((uint)std::ceil(renderSize.x), maskDesc.Width);
+	const uint copyHeight = std::min((uint)std::ceil(renderSize.y), maskDesc.Height);
+	if (!copyWidth || !copyHeight) {
+		globals::profiler->EndPass();
+		return;
+	}
+
+	const bool reverseZ = globals::features::reverseZ.IsActive();
+
+	ShadowMaskFilterCB data{};
+	data.CameraData = Util::GetCameraData();
+	data.DepthScale = { (float)depthDesc.Width / maskSize.x, (float)depthDesc.Height / maskSize.y };
+	data.RenderSize = { (float)copyWidth, (float)copyHeight };
+	data.FarDepthValue = reverseZ ? 0.0f : 1.0f;
+	data.ReverseZ = reverseZ;
+	shadowMaskFilterCB->Update(data);
+
+	ID3D11ShaderResourceView* views[2] = { shadowMask.SRV, depthSRV };
+	context->CSSetShaderResources(0, 2, views);
+
+	auto uav = filteredShadowMaskTexture->uav.get();
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+
+	auto buffer = shadowMaskFilterCB->CB();
+	context->CSSetConstantBuffers(0, 1, &buffer);
+
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch((copyWidth + 7) / 8, (copyHeight + 7) / 8, 1);
+
+	views[0] = nullptr;
+	views[1] = nullptr;
+	context->CSSetShaderResources(0, 2, views);
+
+	uav = nullptr;
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+
+	buffer = nullptr;
+	context->CSSetConstantBuffers(0, 1, &buffer);
+
+	context->CSSetShader(nullptr, nullptr, 0);
+
+	D3D11_BOX box{ 0, 0, 0, copyWidth, copyHeight, 1 };
+	context->CopySubresourceRegion(shadowMask.texture, 0, 0, 0, 0, filteredShadowMaskTexture->resource.get(), 0, &box);
+
+	globals::profiler->EndPass();
 }
 
 void ScreenSpaceShadows::DrawShadows()
@@ -351,14 +334,7 @@ void ScreenSpaceShadows::DrawShadows()
 	float InvTexSizeX = 1.0f / (float)viewportSize[0];
 	float InvTexSizeY = 1.0f / (float)viewportSize[1];
 
-	const uint requestedSampleCount = SelectSampleCount(GetAdaptiveReachScale(light));
-	RequestRaymarch(requestedSampleCount);
-	PrefetchRaymarchVariants();
-	uint usedSampleCount = 0;
-	if (auto* raymarchCS = GetComputeRaymarch(requestedSampleCount, usedSampleCount)) {
-		lastCompiledSampleCount = usedSampleCount;
-		Dispatch(raymarchCS, lightProjectionF.data(), InvTexSizeX, InvTexSizeY);
-	}
+	Dispatch(GetComputeRaymarch(), lightProjectionF.data(), InvTexSizeX, InvTexSizeY);
 
 	ID3D11ShaderResourceView* views[1]{ nullptr };
 	context->CSSetShaderResources(0, 1, views);
@@ -378,6 +354,9 @@ void ScreenSpaceShadows::DrawShadows()
 void ScreenSpaceShadows::Prepass()
 {
 	auto context = globals::d3d::context;
+
+	if (bendSettings.FilterShadowMask && shadowMaskFrame == globals::state->frameCount)
+		FilterShadowMask();
 
 	float white[4] = { 1, 1, 1, 1 };
 	context->ClearUnorderedAccessViewFloat(screenSpaceShadowsTexture->uav.get(), white);
@@ -460,6 +439,41 @@ void ScreenSpaceShadows::SetupResources()
 		screenSpaceShadowsTexture = new Texture2D(texDesc, "SSS::ShadowTexture");
 		screenSpaceShadowsTexture->CreateSRV(srvDesc);
 		screenSpaceShadowsTexture->CreateUAV(uavDesc);
+	}
+
+	shadowMaskFilterCB = new ConstantBuffer(ConstantBufferDesc<ShadowMaskFilterCB>(), "SSS::ShadowMaskFilterCB");
+
+	{
+		auto device = globals::d3d::device;
+		auto shadowMask = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+
+		D3D11_TEXTURE2D_DESC texDesc{};
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+
+		shadowMask.texture->GetDesc(&texDesc);
+		shadowMask.SRV->GetDesc(&srvDesc);
+
+		UINT formatSupport = 0;
+		if (texDesc.SampleDesc.Count == 1 &&
+			SUCCEEDED(device->CheckFormatSupport(srvDesc.Format, &formatSupport)) &&
+			(formatSupport & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)) {
+			texDesc.MipLevels = 1;
+			texDesc.ArraySize = 1;
+			texDesc.Usage = D3D11_USAGE_DEFAULT;
+			texDesc.CPUAccessFlags = 0;
+			texDesc.MiscFlags = 0;
+			texDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+				.Format = srvDesc.Format,
+				.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+				.Texture2D = { .MipSlice = 0 }
+			};
+			filteredShadowMaskTexture = new Texture2D(texDesc, "SSS::FilteredShadowMask");
+			filteredShadowMaskTexture->CreateUAV(uavDesc);
+		} else {
+			logger::warn("[SSS] Shadow mask format {} has no typed UAV support, shadow mask filter disabled", magic_enum::enum_name(srvDesc.Format));
+		}
 	}
 }
 #undef I18N_KEY_PREFIX

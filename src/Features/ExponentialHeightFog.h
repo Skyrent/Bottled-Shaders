@@ -41,8 +41,6 @@ public:
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 
-	/** @brief Registers all fog parameters as weather-interpolatable variables. */
-	void RegisterWeatherVariables() override;
 	/** @brief Captures the current directional shadow map SRV for use in volumetric fog light scattering. */
 	void CaptureDirectionalShadowMap();
 
@@ -120,7 +118,7 @@ public:
 	Settings GetCommonBufferData() const;
 
 private:
-	void DrawGeneralSettings();
+	void DrawHeightFogSettings();
 	void DrawVolumetricSettings();
 
 	Settings previousFogSettings = {};
@@ -156,6 +154,8 @@ private:
 	ID3D11ComputeShader* GetFarLightScatteringCS();
 	ID3D11ComputeShader* GetIntegrationCS();
 	ID3D11ComputeShader* GetFarIntegrationCS();
+	ID3D11ComputeShader* GetFogIBLColorCS();
+	void UpdateFogIBLColor();
 
 	std::unique_ptr<Texture3D> vBufferA;
 	std::unique_ptr<Texture3D> vBufferAFar;
@@ -182,6 +182,8 @@ private:
 	ID3D11ComputeShader* farLightScatteringCS = nullptr;
 	ID3D11ComputeShader* integrationCS = nullptr;
 	ID3D11ComputeShader* farIntegrationCS = nullptr;
+	ID3D11ComputeShader* fogIBLColorCS = nullptr;
+	std::unique_ptr<Texture2D> fogIBLColor;
 	DirectX::XMUINT4 currentGridSize = {};
 	DirectX::XMUINT4 currentFarGridSize = {};
 	bool hasLightScatteringHistory = false;

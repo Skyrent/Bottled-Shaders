@@ -1,7 +1,7 @@
 #ifndef __EXPONENTIAL_HEIGHT_FOG_HLSLI__
 #define __EXPONENTIAL_HEIGHT_FOG_HLSLI__
 
-#include "Common/Color.hlsli"
+#include "Common/ColorManagement.hlsli"
 #include "Common/Math.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
@@ -17,6 +17,7 @@
 
 Texture3D<float4> ExponentialHeightFogIntegratedLightScattering : register(t19);
 Texture3D<float4> ExponentialHeightFogIntegratedLightScatteringFar : register(t22);
+Texture2D<float4> ExponentialHeightFogIBLFogColor : register(t21);
 
 namespace ExponentialHeightFog
 {
@@ -209,10 +210,13 @@ namespace ExponentialHeightFog
 			fogInscatteringColor = GetFogAmbientColor(viewToPosLength);
 		} else if (SharedData::exponentialHeightFogSettings.originalFogColorAmount > 0.0f) {
 			if (!SharedData::InInterior) {
-				fogColor = Color::Fog(SharedData::exponentialHeightFogSettings.vanillaFogNearColor.rgb);
+				fogColor = ColorManagement::SRGBToWorking(SharedData::exponentialHeightFogSettings.vanillaFogNearColor.rgb);
 #if defined(IBL)
-				if (SharedData::iblSettings.EnableIBL)
-					fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);
+				if (SharedData::iblSettings.EnableIBL) {
+					const float4 iblFogColor = ExponentialHeightFogIBLFogColor.Load(int3(0, 0, 0));
+					if (iblFogColor.w > 0.0f)
+						fogColor = iblFogColor.rgb;
+				}
 #endif
 			}
 			fogInscatteringColor = fogColor * SharedData::exponentialHeightFogSettings.originalFogColorAmount;

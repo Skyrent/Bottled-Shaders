@@ -112,6 +112,8 @@ void LightLimitFix::DrawSettings()
 							  "Short screen-space shadows traced toward every point light.\n"
 							  "They add the contact detail shadow maps miss and give lights without a shadow map a shadow of their own."));
 	}
+	if (settings.EnableContactShadows != AreContactShadowsCompiled())
+		Util::Text::Warning("%s", T(TKEY("contact_shadows_restart"), "Restart the game to apply."));
 
 	if (settings.EnableContactShadows) {
 		ImGui::SliderInt(T(TKEY("contact_shadow_max_steps"), "Max Steps"), (int*)&settings.ContactShadowMaxSteps, 1, 32, "%d", ImGuiSliderFlags_AlwaysClamp);
@@ -149,6 +151,7 @@ void LightLimitFix::DrawSettings()
 
 	if (ImGui::TreeNodeEx(T(TKEY("statistics"), "Statistics"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Text(std::format("Clustered Light Count : {}", lightCount).c_str());
+		ImGui::Text("%s", std::vformat(T(TKEY("particle_light_count"), "Particle Lights : {}"), std::make_format_args(particleLightCount)).c_str());
 		if (IsLocalShadowsEnabled()) {
 			ImGui::Text("%s", std::vformat(T(TKEY("shadow_casters_stats"), "Shadow Casters : {} tracked, {} cached, {} rendered this frame"),
 								  std::make_format_args(localShadowStatTracked, localShadowStatCached, localShadowStatRendered))
@@ -205,6 +208,15 @@ void LightLimitFix::DrawOverlay()
 	ImGui::End();
 }
 
+bool LightLimitFix::AreContactShadowsCompiled()
+{
+	if (!contactShadowsLatched) {
+		contactShadowsLatched = true;
+		contactShadowsAtBoot = settings.EnableContactShadows;
+	}
+	return contactShadowsAtBoot;
+}
+
 LightLimitFix::PerFrame LightLimitFix::GetCommonBufferData()
 {
 	PerFrame perFrame{};
@@ -216,7 +228,7 @@ LightLimitFix::PerFrame LightLimitFix::GetCommonBufferData()
 		return std::isfinite(a_value) ? std::clamp(a_value, a_min, a_max) : a_min;
 	};
 
-	perFrame.EnableContactShadows = settings.EnableContactShadows;
+	perFrame.EnableContactShadows = settings.EnableContactShadows && AreContactShadowsCompiled();
 	perFrame.ContactShadowMaxSteps = std::clamp<uint>(settings.ContactShadowMaxSteps, 1u, 32u);
 	perFrame.ContactShadowMaxDistance = sanitize(settings.ContactShadowMaxDistance, 64.0f, 8192.0f);
 	perFrame.ContactShadowLength = sanitize(settings.ContactShadowLength, 1.0f, 256.0f);
@@ -575,7 +587,8 @@ LightLimitFix::LightData LightLimitFix::ProcessLight(RE::BSLight* bsLight, RE::N
 
 	LightData light{};
 	light.lightFlags = runtimeData->flags;
-	light.color = { runtimeData->diffuse.red, runtimeData->diffuse.green, runtimeData->diffuse.blue };
+	const auto workingColor = globals::features::linearLighting.LightColorToWorking(niLight);
+	light.color = { workingColor.red, workingColor.green, workingColor.blue };
 	light.radius = runtimeData->radius;
 	light.fade = runtimeData->fade;
 
@@ -599,7 +612,7 @@ float LightLimitFix::CalculateRadius(const float intensity, const bool shadowCas
 	float cutoff = shadowCaster ? DefaultShadowCasterCutoff : DefaultCutoff;
 	cutoff = cutoffOverride == 1.f ? cutoff : cutoffOverride;
 	const float radius = std::sqrt(ScaledUnitsSq * ((2 * intensity - cutoff * size * size) / (2 * cutoff)));
-	return isnan(radius) ? 1.f : radius;
+	return radius > 0.f ? radius : 1.f;
 }
 
 inline float LightLimitFix::SmoothStep(const float edge0, const float edge1, const float x)
@@ -876,7 +889,7 @@ namespace
 		std::uint8_t data[4];
 	};
 
-	bool TryGetAlphaWeightedVertexColor(const std::uint8_t* a_rawVertexData, std::uint32_t a_vertexSize, std::uint32_t a_colorOffset, std::uint32_t a_vertexCount, VertexColor& a_outVertexColor)
+	bool TryGetAlphaWeightedVertexColor(const std::uint8_t* a_rawVertexData, std::uint32_t a_vertexSize, std::uint32_t a_colorOffset, std::uint32_t a_vertexCount, RE::NiColorA& a_outVertexColor)
 	{
 		if (!a_rawVertexData || a_vertexSize < sizeof(VertexColor) || a_vertexCount == 0)
 			return false;
@@ -890,10 +903,12 @@ namespace
 		for (std::uint32_t v = 0; v < a_vertexCount; ++v) {
 			const auto byteOffset = static_cast<std::size_t>(a_vertexSize) * v + a_colorOffset;
 			const auto* vertex = reinterpret_cast<const VertexColor*>(a_rawVertexData + byteOffset);
-			float alpha = vertex->data[3];
-			weightedR += vertex->data[0] * alpha;
-			weightedG += vertex->data[1] * alpha;
-			weightedB += vertex->data[2] * alpha;
+			const float alpha = vertex->data[3];
+			float color[]{ vertex->data[0] / 255.0f, vertex->data[1] / 255.0f, vertex->data[2] / 255.0f };
+			globals::features::linearLighting.SRGBToWorking(color);
+			weightedR += color[0] * alpha;
+			weightedG += color[1] * alpha;
+			weightedB += color[2] * alpha;
 			totalAlpha += alpha;
 			if (vertex->data[3] > maxAlpha)
 				maxAlpha = vertex->data[3];
@@ -902,27 +917,8 @@ namespace
 		if (totalAlpha == 0.f)
 			return false;
 
-		a_outVertexColor.data[0] = static_cast<std::uint8_t>(std::min(weightedR / totalAlpha, 255.f));
-		a_outVertexColor.data[1] = static_cast<std::uint8_t>(std::min(weightedG / totalAlpha, 255.f));
-		a_outVertexColor.data[2] = static_cast<std::uint8_t>(std::min(weightedB / totalAlpha, 255.f));
-		a_outVertexColor.data[3] = maxAlpha;
+		a_outVertexColor = { weightedR / totalAlpha, weightedG / totalAlpha, weightedB / totalAlpha, maxAlpha / 255.0f };
 		return true;
-	}
-
-	RE::NiColorA BuildEffectMaterialEmissiveTint(RE::BSEffectShaderMaterial* a_material, RE::BSEffectShaderProperty* a_shaderProperty)
-	{
-		RE::NiColorA tint{
-			a_material->baseColor.red * a_material->baseColorScale,
-			a_material->baseColor.green * a_material->baseColorScale,
-			a_material->baseColor.blue * a_material->baseColorScale,
-			1.0f
-		};
-		if (auto emittance = a_shaderProperty->emittanceColor) {
-			tint.red *= emittance->red;
-			tint.green *= emittance->green;
-			tint.blue *= emittance->blue;
-		}
-		return tint;
 	}
 
 	std::optional<std::string> GetLowercaseStem(const char* a_path)
@@ -933,6 +929,36 @@ namespace
 			return std::nullopt;
 		std::transform(stem.begin(), stem.end(), stem.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 		return stem;
+	}
+
+	bool IsParticleLightShape(RE::BSGeometry* a_geometry, RE::BSShaderProperty* a_shaderProperty)
+	{
+		using Flag = RE::BSShaderProperty::EShaderPropertyFlag;
+		if (!a_shaderProperty->flags.all(Flag::kSoftEffect, Flag::kZBufferTest))
+			return false;
+
+		auto* alphaProperty = static_cast<RE::NiAlphaProperty*>(a_geometry->GetGeometryRuntimeData().alphaProperty.get());
+		return alphaProperty && alphaProperty->alphaFlags == 4109;
+	}
+
+	std::uintptr_t FindPersistentPassListDrawCall()
+	{
+		constexpr std::size_t scanBytes = 0x200;
+		constexpr std::size_t callSize = 5;
+		const auto function = REL::RelocationID(100840, 107630).address();
+		const auto target = REL::RelocationID(100854, 107644).address();
+
+		std::uintptr_t found = 0;
+		for (auto site = function; site + callSize <= function + scanBytes; ++site) {
+			if (*reinterpret_cast<const std::uint8_t*>(site) != 0xE8)
+				continue;
+			if (site + callSize + *reinterpret_cast<const std::int32_t*>(site + 1) != target)
+				continue;
+			if (found)
+				return 0;
+			found = site;
+		}
+		return found;
 	}
 }
 
@@ -986,16 +1012,16 @@ void LightLimitFix::ParticleLightConfigStore::Load()
 	}
 }
 
-LightLimitFix::VertexColorCacheEntry LightLimitFix::GetParticleLightConfig(RE::BSRenderPass* a_pass)
+LightLimitFix::VertexColorCacheEntry LightLimitFix::GetParticleLightConfig(RE::BSGeometry* a_geometry, RE::BSShaderProperty* a_shaderProperty)
 {
-	if (!a_pass || !a_pass->geometry || !a_pass->shaderProperty)
+	if (!a_geometry || !a_shaderProperty)
 		return {};
 
 	if (!settings.EnableParticleLights)
 		return {};
 
-	auto shaderProperty = a_pass->shaderProperty->GetRTTI() == globals::rtti::BSEffectShaderPropertyRTTI.get() ?
-	                          static_cast<RE::BSEffectShaderProperty*>(a_pass->shaderProperty) :
+	auto shaderProperty = a_shaderProperty->GetRTTI() == globals::rtti::BSEffectShaderPropertyRTTI.get() ?
+	                          static_cast<RE::BSEffectShaderProperty*>(a_shaderProperty) :
 	                          nullptr;
 	if (!shaderProperty || shaderProperty->lightData)
 		return {};
@@ -1004,16 +1030,20 @@ LightLimitFix::VertexColorCacheEntry LightLimitFix::GetParticleLightConfig(RE::B
 	if (!material)
 		return {};
 
-	auto parent = a_pass->geometry->parent;
+	auto parent = a_geometry->parent;
 	if (!parent || parent->GetRTTI() != globals::rtti::NiBillboardNodeRTTI.get())
 		return {};
 
-	auto* node = a_pass->geometry;
+	auto* node = a_geometry;
+	auto& linearLighting = globals::features::linearLighting;
+	const bool colorManagementEnabled = linearLighting.IsLinearLightingActive();
+	const bool acesCgEnabled = colorManagementEnabled && linearLighting.IsACEScgActive();
 
 	{
 		std::shared_lock lock{ particleLightsMutex };
 		auto it = vertexColorCache.find(node);
-		if (it != vertexColorCache.end()) {
+		if (it != vertexColorCache.end() &&
+			(!it->second.valid || (it->second.colorManagementEnabled == colorManagementEnabled && it->second.acescgEnabled == acesCgEnabled))) {
 			return it->second;
 		}
 	}
@@ -1042,33 +1072,27 @@ LightLimitFix::VertexColorCacheEntry LightLimitFix::GetParticleLightConfig(RE::B
 
 	VertexColorCacheEntry entry{};
 	entry.valid = true;
-	entry.applyEffectMaterialTint = true;
+	entry.colorManagementEnabled = colorManagementEnabled;
+	entry.acescgEnabled = acesCgEnabled;
 	entry.config = config;
 	entry.baseColor = { 1, 1, 1, 1 };
-	bool hasVertexTint = false;
-	if (auto rendererData = a_pass->geometry->GetGeometryRuntimeData().rendererData) {
-		if (auto triShape = a_pass->geometry->AsTriShape()) {
+	if (auto rendererData = a_geometry->GetGeometryRuntimeData().rendererData) {
+		if (auto triShape = a_geometry->AsTriShape()) {
 			const std::uint32_t vertexSize = rendererData->vertexDesc.GetSize();
 			if (rendererData->vertexDesc.HasFlag(RE::BSGraphics::Vertex::Flags::VF_COLORS) && rendererData->rawVertexData && vertexSize > 0u) {
 				const std::uint32_t offset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::Attribute::VA_COLOR);
 				const std::uint32_t vertexCount = static_cast<std::uint32_t>(triShape->GetTrishapeRuntimeData().vertexCount);
 
-				VertexColor weightedVC{};
+				RE::NiColorA weightedVC{};
 				if (TryGetAlphaWeightedVertexColor(rendererData->rawVertexData, vertexSize, offset, vertexCount, weightedVC)) {
-					entry.baseColor.red *= weightedVC.data[0] / 255.f;
-					entry.baseColor.green *= weightedVC.data[1] / 255.f;
-					entry.baseColor.blue *= weightedVC.data[2] / 255.f;
-					hasVertexTint = true;
+					entry.baseColor.red *= weightedVC.red;
+					entry.baseColor.green *= weightedVC.green;
+					entry.baseColor.blue *= weightedVC.blue;
 					if (shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kVertexAlpha))
-						entry.baseColor.alpha *= weightedVC.data[3] / 255.f;
+						entry.baseColor.alpha *= weightedVC.alpha;
 				}
 			}
 		}
-	}
-
-	if (!hasVertexTint) {
-		entry.baseColor = BuildEffectMaterialEmissiveTint(material, shaderProperty);
-		entry.applyEffectMaterialTint = false;
 	}
 
 	{
@@ -1094,16 +1118,16 @@ bool LightLimitFix::QueueParticleLight(RE::BSRenderPass* a_pass, VertexColorCach
 		return false;
 
 	RE::NiColorA color = a_reference.baseColor;
-	if (a_reference.applyEffectMaterialTint) {
-		color.red *= material->baseColor.red * material->baseColorScale;
-		color.green *= material->baseColor.green * material->baseColorScale;
-		color.blue *= material->baseColor.blue * material->baseColorScale;
+	auto materialColor = globals::features::linearLighting.SRGBToWorking({ material->baseColor.red, material->baseColor.green, material->baseColor.blue });
+	color.red *= materialColor.red * material->baseColorScale;
+	color.green *= materialColor.green * material->baseColorScale;
+	color.blue *= materialColor.blue * material->baseColorScale;
 
-		if (auto emittance = shaderProperty->emittanceColor) {
-			color.red *= emittance->red;
-			color.green *= emittance->green;
-			color.blue *= emittance->blue;
-		}
+	if (auto emittance = shaderProperty->emittanceColor) {
+		auto emittanceColor = globals::features::linearLighting.SRGBToWorking(*emittance);
+		color.red *= emittanceColor.red;
+		color.green *= emittanceColor.green;
+		color.blue *= emittanceColor.blue;
 	}
 
 	ResolvedParticleLight resolved;
@@ -1122,15 +1146,10 @@ bool LightLimitFix::CheckParticleLights(RE::BSRenderPass* a_pass, uint32_t)
 	if (!a_pass || !a_pass->geometry || !a_pass->shaderProperty)
 		return true;
 
-	using Flag = RE::BSShaderProperty::EShaderPropertyFlag;
-	if (!a_pass->shaderProperty->flags.all(Flag::kSoftEffect, Flag::kZBufferTest))
+	if (!IsParticleLightShape(a_pass->geometry, a_pass->shaderProperty))
 		return true;
 
-	auto* alphaProperty = static_cast<RE::NiAlphaProperty*>(a_pass->geometry->GetGeometryRuntimeData().alphaProperty.get());
-	if (!alphaProperty || alphaProperty->alphaFlags != 4109)
-		return true;
-
-	auto reference = GetParticleLightConfig(a_pass);
+	auto reference = GetParticleLightConfig(a_pass->geometry, a_pass->shaderProperty);
 	if (reference.valid) {
 		if (QueueParticleLight(a_pass, reference))
 			return !(settings.EnableParticleLightsCulling && reference.config.cull);
@@ -1138,8 +1157,18 @@ bool LightLimitFix::CheckParticleLights(RE::BSRenderPass* a_pass, uint32_t)
 	return true;
 }
 
+bool LightLimitFix::IsParticleLightEmitter(RE::BSGeometry* a_geometry)
+{
+	if (!loaded || !a_geometry)
+		return false;
+
+	auto* shaderProperty = a_geometry->GetGeometryRuntimeData().shaderProperty.get();
+	return shaderProperty && IsParticleLightShape(a_geometry, shaderProperty) && GetParticleLightConfig(a_geometry, shaderProperty).valid;
+}
+
 void LightLimitFix::AddParticleLightsToBuffer(eastl::vector<LightData>& a_lightsData)
 {
+	particleLightCount = 0;
 	if (!settings.EnableParticleLights)
 		return;
 
@@ -1188,6 +1217,7 @@ void LightLimitFix::AddParticleLightsToBuffer(eastl::vector<LightData>& a_lights
 		if ((light.color.x + light.color.y + light.color.z) * light.fade > 1e-4 && light.radius > 1e-4) {
 			light.invRadius = 1.f / light.radius;
 			a_lightsData.push_back(light);
+			particleLightCount++;
 		}
 	}
 }
@@ -2035,6 +2065,10 @@ void LightLimitFix::Hooks::Install()
 	stl::write_thunk_call<RenderPass1>(REL::RelocationID(100877, 107673).address() + REL::Relocate(0x1E5, 0x1EE));
 	stl::write_thunk_call<RenderPass2>(REL::RelocationID(100852, 107642).address() + REL::Relocate(0x29E, 0x28F));
 	stl::write_thunk_call<RenderPass3>(REL::RelocationID(100871, 107667).address() + REL::Relocate(0xEE, 0xED));
+	if (const auto persistentPassCall = FindPersistentPassListDrawCall(); persistentPassCall && SKSE::GetTrampoline().free_size() >= 14)
+		stl::write_thunk_call<RenderPass4>(persistentPassCall);
+	else
+		logger::warn("[LLF] Persistent pass list hook not installed; particle lights inside alpha groups will not be detected");
 	stl::detour_thunk<BSGeometry_Destroy>(REL::RelocationID(69535, 70936));
 
 	logger::info("[LLF] Installed hooks");

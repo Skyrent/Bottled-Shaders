@@ -784,7 +784,7 @@ bool FidelityFX::IsRuntimeFsr4Available() const
 
 bool FidelityFX::ShouldUseRuntimeUpscalerForFSR() const
 {
-	return IsRuntimeUpscalerPresent() && IsAmdAdapterDetected();
+	return globals::features::upscaling.fsr4RuntimeEnableBoot && IsRuntimeUpscalerPresent() && IsAmdAdapterDetected();
 }
 
 bool FidelityFX::CanUseRuntimeUpscalerPath()
@@ -1554,6 +1554,7 @@ bool FidelityFX::DispatchRuntimeUpscalerSingle(uint32_t a_contextIndex, ID3D11Re
 		} else {
 			const uint64_t d3d11SubmitFence = runtimeFenceValue++;
 			DX::ThrowIfFailed(swapChain.d3d11Context->Signal(runtimeD3D11Fence.get(), d3d11SubmitFence));
+			swapChain.d3d11Context->Flush();
 			DX::ThrowIfFailed(swapChain.commandQueue->Wait(runtimeD3D12Fence.get(), d3d11SubmitFence));
 
 			DX::ThrowIfFailed(commandAllocator->Reset());
@@ -1588,7 +1589,7 @@ bool FidelityFX::DispatchRuntimeUpscalerSingle(uint32_t a_contextIndex, ID3D11Re
 			dispatchParameters.preExposure = 1.0f;
 			// Menus produce no fresh motion vectors or depth; reset the history there
 			// rather than accumulating against stale reprojection data.
-			dispatchParameters.reset = state->IsMainOrLoadingMenuOpen();
+			dispatchParameters.reset = state->IsMainOrLoadingMenuOpen() || state->ShouldResetHistory();
 			dispatchParameters.cameraNear = *globals::game::cameraNear;
 			dispatchParameters.cameraFar = *globals::game::cameraFar;
 			dispatchParameters.cameraFovAngleVertical = Util::GetVerticalFOVRad();
@@ -1848,7 +1849,7 @@ bool FidelityFX::UpscaleRegion(uint32_t a_contextIndex, ID3D11Resource* a_color,
 	const bool runtimeFallbackReset = runtimeRequested && runtimeFallbackResetDispatchesRemaining > 0;
 	if (runtimeFallbackReset)
 		runtimeFallbackResetDispatchesRemaining--;
-	dispatchParameters.reset = state->IsMainOrLoadingMenuOpen() || runtimeFallbackReset;
+	dispatchParameters.reset = state->IsMainOrLoadingMenuOpen() || state->ShouldResetHistory() || runtimeFallbackReset;
 	dispatchParameters.preExposure = 1.0f;
 	dispatchParameters.flags = 0;
 

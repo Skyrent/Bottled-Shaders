@@ -1,4 +1,7 @@
-﻿#pragma once
+#pragma once
+#include <array>
+#include <optional>
+
 #include "RE/M/Moon.h"
 
 #include "Utils/Moon.h"
@@ -75,6 +78,24 @@ public:
 	/** @brief 1 when this frame's sunlight was rebuilt from night colours, else 0, so light grading can follow it. */
 	float GetLightNightWeight() const { return lightNightWeight; }
 
+	/** @brief True when this frame's VL was rebuilt from the weathers' night VL. */
+	bool IsNightVolumetricLightingApplied() const { return nightVolumetricLightingApplied; }
+
+	/** @brief The factor this frame's sunlight was dimmed by, lightning excluded; 1 when nothing was dimmed. */
+	float GetAppliedSunlightFactor() const { return appliedSunlightFactor; }
+
+	/**
+	 * @brief True while an Effects 11 preset is active. Sky Sync then only moves the light with the sun and moons and
+	 *        leaves the light colour, the horizon dim and volumetric lighting to the preset.
+	 */
+	bool IsEffects11Active() const;
+
+	/** @brief The engine's VL fallback for weathers without a VL form, read from the fVolumetricLighting*:Display INI settings. */
+	static RE::BSVolumetricLightingRenderData GetDefaultVolumetricLighting();
+
+	/** @brief Blends the current and last weathers' night VL with the given weights, as vanilla's time-of-day VL blend does. */
+	static RE::BSVolumetricLightingRenderData BlendNightVolumetricLighting(const RE::Sky* sky, float currentWeight, float lastWeight);
+
 	/** @brief Installs rendering hooks and detects conflicting mods after plugin load. */
 	virtual void PostPostLoad() override;
 	/** @brief Checks for conflicting ESP files after game data is loaded. */
@@ -84,7 +105,7 @@ public:
 
 	struct Sky_Update
 	{
-		static void thunk(RE::Sky* sky);
+		static void thunk(RE::Sky* sky, float deltaTime);
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 
@@ -156,8 +177,8 @@ private:
 		/** @brief Fraction of the current transition completed, 0 to 1. */
 		float Progress(float fadeDuration) const { return fadeDuration > 0.0f ? fadeTimer / fadeDuration : 1.0f; }
 
-		void Update(const RE::Sky* sky, RE::NiPoint3 dirs[], float intensities[], float fadeDuration, float fadeAdvance, bool a_immediateTransition);
-		static void SetLighting(const RE::Sky* sky, RE::NiPoint3 dir);
+		void Update(const RE::Sky* sky, RE::NiPoint3 dirs[], float intensities[], std::optional<std::array<RE::NiColor, 3>> colors, float fadeDuration, float fadeAdvance, bool a_immediateTransition);
+		static void SetLighting(const RE::Sky* sky, RE::NiPoint3 dir, float intensity, std::optional<RE::NiColor> color);
 		static void SetDirection(RE::NiPoint3& dir, float headingRadians, float elevRadians);
 		static void SetElevation(RE::NiPoint3& dir, float elevRadians);
 		static void ClampDirection(RE::NiPoint3& dir);
@@ -174,7 +195,6 @@ private:
 	static constexpr float AlignmentFadeStartAngle = 2.0f;
 	static constexpr float AlignmentFadeEndAngle = 15.0f;
 	static constexpr float MaxHorizonFadeHours = 1.5f;
-	static constexpr float HoursPerTimingUnit = 1.0f / 6.0f;
 	static constexpr float DefaultSunAlphaTransTime = 2.0f;
 	static constexpr float AlternateSunHorizonOffsetHours = 0.25f;
 	static constexpr float MaxHorizonFadeElevation = 45.0f;
@@ -206,11 +226,14 @@ private:
 	float4 colors[BodyCount] = {};
 	RE::NiPoint3 rawDirections[BodyCount] = {};  // sky-local, before shadow elevation locking; zero when not computed this frame
 	float currentDim = 1.0f;
+	std::optional<std::array<RE::NiColor, 3>> workingLightColors = {};
 	float moonlightFade = 0.0f;
 	float twilightCap = 0.0f;
 	float moonNightWeight = 0.0f;
 	float lightNightWeight = 0.0f;
 	float flashWeight = 0.0f;  // lightning's share of this frame's directional light
+	float appliedSunlightFactor = 1.0f;
+	bool nightVolumetricLightingApplied = false;
 	bool sunBelowHorizon = false;
 	ShadowFader shadowFader;
 
@@ -254,20 +277,11 @@ private:
 	/** @brief Re-evaluates worldspaceDisabled; call whenever the current worldspace or the disabled list changes. */
 	void UpdateWorldspaceDisabled() { worldspaceDisabled = IsWorldspaceDisabled(currentCellWorldspace); }
 
-	/** @brief Midpoint hour of a climate sunrise or sunset interval, using the same float ops as Sun::Update. */
-	static float MiddleHour(const RE::TESClimate::Timing::Interval& interval);
-
 	/** @brief Hours at which the active sun path crosses the horizon, as { sunrise, sunset }. */
 	std::pair<float, float> GetSunHorizonHours(const RE::TESClimate::Timing& timing) const;
 
 	/** @brief The lightning flash Sky::UpdateColors adds to the directional light, 0 during weather transitions as in vanilla. */
 	static float GetDirectionalFlash(const RE::Sky* sky);
-
-	/** @brief The engine's VL fallback for weathers without a VL form, read from the fVolumetricLighting*:Display INI settings. */
-	static RE::BSVolumetricLightingRenderData GetDefaultVolumetricLighting();
-
-	/** @brief Blends the current and last weathers' night VL with the given weights, as vanilla's time-of-day VL blend does. */
-	static RE::BSVolumetricLightingRenderData BlendNightVolumetricLighting(const RE::Sky* sky, float currentWeight, float lastWeight);
 
 	void ProcessSun(const RE::Sky* sky, const RE::NiPoint3& sunDir, float sunHeight, RE::NiPoint3 dirs[], float intensities[]);
 
